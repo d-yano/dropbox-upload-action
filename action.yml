@@ -1,0 +1,168 @@
+name: 'Dropbox Upload Action'
+description: 'Dropbox へファイルを簡単にアップロードするためのアクションです。'
+author: 'd-yano'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  dropbox_token:
+    description: 'Dropbox アクセストークン'
+    required: true
+  files:
+    description: 'アップロード対象のファイルパスまたはGlobパターン（複数行対応）'
+    required: true
+  archive:
+    description: 'アップロード前に .tar.gz 形式でアーカイブするかどうか (true で有効)'
+    required: false
+    default: 'false'
+  archive_name:
+    description: 'アーカイブファイル名 (archive: true の場合のみ有効)'
+    required: false
+    default: 'artifact.tar.gz'
+  remote_path:
+    description: 'Dropbox上の保存先ディレクトリパス'
+    required: false
+    default: '/ci-artifacts/${{ github.repository }}/${{ github.ref_name }}/${{ github.run_id }}'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Upload to Dropbox
+      shell: bash
+      env:
+        DROPBOX_ACCESS_TOKEN: ${{ inputs.dropbox_token }}
+        INPUT_FILES: ${{ inputs.files }}
+        SHOULD_ARCHIVE: ${{ inputs.archive }}
+        ARCHIVE_NAME: ${{ inputs.archive_name }}
+        REMOTE_DIR: ${{ inputs.remote_path }}
+      run: |
+        set -euo pipefail
+
+        # --- 定数定義 ---
+        # Dropbox APIの単純アップロード上限は150MB
+        MAX_SIMPLE=$((150 * 1024 * 1024))
+        CHUNK_SIZE=$((100 * 1024 * 1024))
+        DIST_DIR="dist_buffer"
+
+        echo "::group::ファイル収集処理"
+        mkdir -p "$DIST_DIR"
+        
+        # 入力をパースしてバッファディレクトリへコピー
+        echo "$INPUT_FILES" | while read -r pattern; do
+          [ -z "$pattern" ] && continue
+          # 空マッチのエラーを抑制し、最終的なファイル有無で判定する
+          cp -r $pattern "$DIST_DIR/" || echo "警告: パターン '$pattern' に一致するファイルがありません。"
+        done
+
+        if [ -z "$(ls -A "$DIST_DIR")" ]; then
+           echo "::error::アップロード対象のファイルが見つかりません。"
+           exit 1
+        fi
+        echo "ファイルの収集完了。"
+        echo "::endgroup::"
+
+        # --- アーカイブ処理 ---
+        if [ "$SHOULD_ARCHIVE" == "true" ]; then
+          echo "::group::アーカイブ作成"
+          echo "アーカイブを作成中: $ARCHIVE_NAME"
+          
+          tar -czf "$ARCHIVE_NAME" -C "$DIST_DIR" .
+          
+          # バッファの中身をアーカイブのみに置き換え
+          rm -rf "$DIST_DIR:?"/*
+          mv "$ARCHIVE_NAME" "$DIST_DIR/"
+          echo "アーカイブ作成完了。"
+          echo "::endgroup::"
+        fi
+
+        # --- アップロード実行 ---
+        # リモートパスの正規化（末尾のスラッシュ削除）
+        REMOTE_DIR=${REMOTE_DIR%/}
+        
+        for FILE in "$DIST_DIR"/*; do
+          [ -f "$FILE" ] || continue
+          
+          FILENAME=$(basename "$FILE")
+          FILE_SIZE=$(stat -c%s "$FILE")
+          DBX_PATH="${REMOTE_DIR}/${FILENAME}"
+
+          echo "::group::アップロード開始: $FILENAME"
+          echo "サイズ: $FILE_SIZE bytes"
+          echo "保存先: $DBX_PATH"
+
+          if [ "$FILE_SIZE" -le "$MAX_SIMPLE" ]; then
+            # 通常アップロード (/files/upload)
+            API_ARG=$(printf '{"path": "%s","mode":"add","autorename":true,"mute":false,"strict_conflict":false}' "$DBX_PATH")
+            
+            RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload \
+              --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+              --header "Dropbox-API-Arg: $API_ARG" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary @"$FILE")
+
+          else
+            # 分割アップロード (/files/upload_session/*)
+            echo "大容量ファイルを検知。セッションアップロードを開始します..."
+            TMP_CHUNK=".dbx_chunk.bin"
+            
+            # 1. セッション開始
+            dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 status=none
+            RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/start \
+              --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+              --header "Dropbox-API-Arg: {\"close\": false}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary @"$TMP_CHUNK")
+            
+            SESSION_ID=$(echo "$RESP" | sed -E 's/.*"session_id": *"([^"]+)".*/\1/')
+            
+            if [ -z "$SESSION_ID" ]; then
+              echo "::error::アップロードセッションの開始に失敗しました。"
+              echo "$RESP"
+              exit 1
+            fi
+
+            # 2. チャンク追加ループ
+            OFFSET=$CHUNK_SIZE
+            while [ "$OFFSET" -lt "$FILE_SIZE" ]; do
+              REMAINING=$((FILE_SIZE - OFFSET))
+              
+              if [ "$REMAINING" -le "$CHUNK_SIZE" ]; then
+                # 最終コミット (Finish)
+                dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 skip=$((OFFSET / CHUNK_SIZE)) status=none
+                API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "commit": {"path": "%s","mode": "add","autorename": true,"mute": false,"strict_conflict": false}}' "$SESSION_ID" "$OFFSET" "$DBX_PATH")
+                
+                RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/finish \
+                  --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+                  --header "Dropbox-API-Arg: $API_ARG" \
+                  --header "Content-Type: application/octet-stream" \
+                  --data-binary @"$TMP_CHUNK")
+                  
+                OFFSET=$FILE_SIZE
+              else
+                # 追加 (Append)
+                dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 skip=$((OFFSET / CHUNK_SIZE)) status=none
+                API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "close": false}' "$SESSION_ID" "$OFFSET")
+                
+                RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/append_v2 \
+                  --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+                  --header "Dropbox-API-Arg: $API_ARG" \
+                  --header "Content-Type: application/octet-stream" \
+                  --data-binary @"$TMP_CHUNK")
+                  
+                OFFSET=$((OFFSET + CHUNK_SIZE))
+              fi
+            done
+            rm -f "$TMP_CHUNK"
+          fi
+
+          # レスポンス検証
+          if echo "$RESP" | grep -q '"error"'; then
+             echo "::error::$FILENAME のアップロードに失敗しました。"
+             echo "$RESP"
+             exit 1
+          else
+             echo "アップロード完了。"
+          fi
+          echo "::endgroup::"
+        done
