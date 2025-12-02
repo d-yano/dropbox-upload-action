@@ -1,11 +1,11 @@
 # Dropbox Upload Action
-GitHub Actions workflow から Dropbox へファイルを簡単にアップロードするためのアクションです。
+GitHub Actions workflow から Dropbox へファイルを簡単にアップロードするためのアクションです。  
 `actions/upload-artifact` ライクな使い心地で、バックアップや成果物の共有に使えます。
 
 ## 特徴
-本アクションは、GitHub Actions ワークフローから Dropbox へのファイルアップロードをサポートします。
-また、Dropbox APIの仕様に従って150MBを超える大容量ファイルを自動的に検知し、分割アップロード（Chunked Upload）転送を行います。
-ファイルの指定はワイルドカードが利用でき、複数のログや成果物をまとめて指定が可能です。
+本アクションは、GitHub Actions ワークフローから Dropbox へのファイルアップロードをサポートします。  
+また、Dropbox APIの仕様に従って150MBを超える大容量ファイルを自動的に検知し、分割アップロード転送を行います。  
+ファイルの指定はワイルドカードが利用でき、複数のログや成果物をまとめて指定が可能です。  
 また、オプション機能を使って自動的に tar.gz 形式に圧縮してからアップロードしたりすることも可能です。
 
 ## 使用方法
@@ -46,10 +46,10 @@ GitHub Actions workflow から Dropbox へファイルを簡単にアップロ�
 | `remote_path` | No | (自動生成) | Dropbox上の保存先ディレクトリ。 |
 
 ## Dropbox Token の取得方法
-1.  [Dropbox App Console](https://www.dropbox.com/developers/apps) にアクセスしてアプリを作成します ("App folder" 権限推奨)。
-2.  "Permissions" タブで `files.content.write` にチェックを入れます。
-3.  "Generated access token" の Generate ボタンを押してトークンを取得します。
-4.  GitHubリポジトリの `Settings` \> `Secrets and variables` \> `Actions` に `DROPBOX_ACCESS_TOKEN` として登録します。
+1. [Dropbox App Console](https://www.dropbox.com/developers/apps) にアクセスしてアプリを作成します ("App folder" 権限推奨)。
+2. "Permissions" タブで `files.content.write` にチェックを入れます。
+3. "Generated access token" の Generate ボタンを押してトークンを取得します。
+4. GitHubリポジトリの `Settings` \> `Secrets and variables` \> `Actions` に `DROPBOX_ACCESS_TOKEN` として登録します。
 
 ## License
 - MIT License
