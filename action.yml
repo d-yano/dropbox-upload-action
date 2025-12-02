@@ -1,14 +1,26 @@
 name: 'Dropbox Upload Action'
-description: 'Dropbox へファイルを簡単にアップロードするためのアクションです。'
+description: 'Dropbox へファイルを簡単にアップロードするためのアクションです（Refresh Token 対応版）'
 author: 'd-yano'
 branding:
   icon: 'upload-cloud'
   color: 'blue'
 
 inputs:
+  # --- 認証関連 (どちらかのセットが必要) ---
   dropbox_token:
-    description: 'Dropbox アクセストークン'
-    required: true
+    description: 'Dropbox アクセストークン (短期間のみ有効)'
+    required: false
+  app_key:
+    description: 'Dropbox App Key (Refresh Token使用時に必須)'
+    required: false
+  app_secret:
+    description: 'Dropbox App Secret (Refresh Token使用時に必須)'
+    required: false
+  refresh_token:
+    description: 'Dropbox Refresh Token (永続的な自動更新に使用)'
+    required: false
+
+  # --- ファイル関連 ---
   files:
     description: 'アップロード対象のファイルパスまたはGlobパターン（複数行対応）'
     required: true
@@ -23,7 +35,7 @@ inputs:
   remote_path:
     description: 'Dropbox上の保存先ディレクトリパス'
     required: false
-    default: '/ci-artifacts/${{ github.repository }}/${{ github.ref_name }}/${{ github.run_id }}'
+    default: ''
 
 runs:
   using: "composite"
@@ -31,28 +43,97 @@ runs:
     - name: Upload to Dropbox
       shell: bash
       env:
-        DROPBOX_ACCESS_TOKEN: ${{ inputs.dropbox_token }}
+        # Inputs を環境変数へ
+        INPUT_DROPBOX_TOKEN: ${{ inputs.dropbox_token }}
+        INPUT_APP_KEY: ${{ inputs.app_key }}
+        INPUT_APP_SECRET: ${{ inputs.app_secret }}
+        INPUT_REFRESH_TOKEN: ${{ inputs.refresh_token }}
+        
         INPUT_FILES: ${{ inputs.files }}
         SHOULD_ARCHIVE: ${{ inputs.archive }}
         ARCHIVE_NAME: ${{ inputs.archive_name }}
-        REMOTE_DIR: ${{ inputs.remote_path }}
+        INPUT_REMOTE_DIR: ${{ inputs.remote_path }}
+        
+        # GitHub コンテキスト (デフォルトパス生成用)
+        GH_REPO: ${{ github.repository }}
+        GH_REF: ${{ github.ref_name }}
+        GH_RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
 
-        # --- 定数定義 ---
-        # Dropbox APIの単純アップロード上限は150MB
-        MAX_SIMPLE=$((150 * 1024 * 1024))
-        CHUNK_SIZE=$((100 * 1024 * 1024))
+        # ========================================================
+        # 1. トークン処理 (Refresh Token)
+        # ========================================================
+        DROPBOX_ACCESS_TOKEN=""
+
+        # Refresh Token がある場合はトークンを新規発行する
+        if [ -n "$INPUT_REFRESH_TOKEN" ] && [ -n "$INPUT_APP_KEY" ] && [ -n "$INPUT_APP_SECRET" ]; then
+          echo "::group::トークンの自動更新 (Refresh Token)"
+          echo "Refresh Token を使用して新しい Access Token を取得します..."
+          
+          # トークン取得 API コール
+          TOKEN_RESPONSE=$(curl -s -X POST https://api.dropbox.com/oauth2/token \
+            -d grant_type=refresh_token \
+            -d refresh_token="$INPUT_REFRESH_TOKEN" \
+            -d client_id="$INPUT_APP_KEY" \
+            -d client_secret="$INPUT_APP_SECRET")
+
+          # 簡易JSONパース
+          NEW_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token": *"[^"]*"' | sed 's/"access_token": *"//;s/"//')
+
+          if [ -n "$NEW_TOKEN" ]; then
+            DROPBOX_ACCESS_TOKEN="$NEW_TOKEN"
+            echo "::add-mask::$NEW_TOKEN"
+            echo "トークンの更新に成功しました。"
+          else
+            echo "::error::トークンの更新に失敗しました。"
+            echo "Response: $TOKEN_RESPONSE"
+            exit 1
+          fi
+          echo "::endgroup::"
+        
+        # Refresh Token がなく、直接指定のトークンがある場合
+        elif [ -n "$INPUT_DROPBOX_TOKEN" ]; then
+          DROPBOX_ACCESS_TOKEN="$INPUT_DROPBOX_TOKEN"
+        
+        else
+          echo "::error::認証情報が不足しています。'dropbox_token' または ('app_key', 'app_secret', 'refresh_token') のセットが必要です。"
+          exit 1
+        fi
+
+        # ========================================================
+        # 2. 定数・パス定義
+        # ========================================================
+        # Dropbox APIの単純アップロード上限は150MB (余裕を見て148MB)
+        MAX_SIMPLE=$((148 * 1024 * 1024))
+        CHUNK_SIZE=$((50 * 1024 * 1024))  # 50MB単位で分割
         DIST_DIR="dist_buffer"
 
+        # リモートパスの決定 (デフォルト値の生成)
+        if [ -z "$INPUT_REMOTE_DIR" ]; then
+          REMOTE_DIR="/ci-artifacts/${GH_REPO}/${GH_REF}/${GH_RUN_ID}"
+        else
+          REMOTE_DIR="$INPUT_REMOTE_DIR"
+        fi
+        # 末尾のスラッシュ削除
+        REMOTE_DIR=${REMOTE_DIR%/}
+
+        # ========================================================
+        # 3. ファイル収集
+        # ========================================================
         echo "::group::ファイル収集処理"
+        rm -rf "$DIST_DIR"
         mkdir -p "$DIST_DIR"
         
         # 入力をパースしてバッファディレクトリへコピー
         echo "$INPUT_FILES" | while read -r pattern; do
           [ -z "$pattern" ] && continue
-          # 空マッチのエラーを抑制し、最終的なファイル有無で判定する
-          cp -r $pattern "$DIST_DIR/" || echo "警告: パターン '$pattern' に一致するファイルがありません。"
+          # ls で存在確認してからコピー (エラー回避)
+          if ls $pattern >/dev/null 2>&1; then
+             cp -r $pattern "$DIST_DIR/"
+          else
+             echo "警告: パターン '$pattern' に一致するファイルがありません。"
+          fi
         done
 
         if [ -z "$(ls -A "$DIST_DIR")" ]; then
@@ -62,24 +143,27 @@ runs:
         echo "ファイルの収集完了。"
         echo "::endgroup::"
 
-        # --- アーカイブ処理 ---
+        # ========================================================
+        # 4. アーカイブ処理 (オプション)
+        # ========================================================
         if [ "$SHOULD_ARCHIVE" == "true" ]; then
           echo "::group::アーカイブ作成"
           echo "アーカイブを作成中: $ARCHIVE_NAME"
           
           tar -czf "$ARCHIVE_NAME" -C "$DIST_DIR" .
           
-          # バッファの中身をアーカイブのみに置き換え
-          rm -rf "$DIST_DIR:?"/*
+          # バッファをアーカイブのみに置き換え
+          rm -rf "$DIST_DIR"
+          mkdir -p "$DIST_DIR"
           mv "$ARCHIVE_NAME" "$DIST_DIR/"
+          
           echo "アーカイブ作成完了。"
           echo "::endgroup::"
         fi
 
-        # --- アップロード実行 ---
-        # リモートパスの正規化（末尾のスラッシュ削除）
-        REMOTE_DIR=${REMOTE_DIR%/}
-        
+        # ========================================================
+        # 5. アップロード実行
+        # ========================================================
         for FILE in "$DIST_DIR"/*; do
           [ -f "$FILE" ] || continue
           
@@ -88,11 +172,12 @@ runs:
           DBX_PATH="${REMOTE_DIR}/${FILENAME}"
 
           echo "::group::アップロード開始: $FILENAME"
-          echo "サイズ: $FILE_SIZE bytes"
-          echo "保存先: $DBX_PATH"
+          echo "  サイズ: $FILE_SIZE bytes"
+          echo "  保存先: $DBX_PATH"
 
           if [ "$FILE_SIZE" -le "$MAX_SIMPLE" ]; then
-            # 通常アップロード (/files/upload)
+            # --- 単純アップロード (/files/upload) ---
+            # JSON作成 (printfで簡易作成)
             API_ARG=$(printf '{"path": "%s","mode":"add","autorename":true,"mute":false,"strict_conflict":false}' "$DBX_PATH")
             
             RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload \
@@ -102,61 +187,78 @@ runs:
               --data-binary @"$FILE")
 
           else
-            # 分割アップロード (/files/upload_session/*)
-            echo "大容量ファイルを検知。セッションアップロードを開始します..."
+            # --- 分割アップロード (/files/upload_session/*) ---
+            echo "  大容量ファイルを検知。分割アップロードを開始します..."
             TMP_CHUNK=".dbx_chunk.bin"
             
-            # 1. セッション開始
+            # (A) セッション開始 (Start)
+            # 最初のチャンクを切り出し
             dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 status=none
+            
             RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/start \
               --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
               --header "Dropbox-API-Arg: {\"close\": false}" \
               --header "Content-Type: application/octet-stream" \
               --data-binary @"$TMP_CHUNK")
             
-            SESSION_ID=$(echo "$RESP" | sed -E 's/.*"session_id": *"([^"]+)".*/\1/')
+            # Session ID 抽出
+            SESSION_ID=$(echo "$RESP" | grep -o '"session_id": *"[^"]*"' | sed 's/"session_id": *"//;s/"//')
             
             if [ -z "$SESSION_ID" ]; then
               echo "::error::アップロードセッションの開始に失敗しました。"
-              echo "$RESP"
+              echo "Response: $RESP"
               exit 1
             fi
+            echo "  セッション開始: $SESSION_ID"
 
-            # 2. チャンク追加ループ
-            OFFSET=$CHUNK_SIZE
-            while [ "$OFFSET" -lt "$FILE_SIZE" ]; do
-              REMAINING=$((FILE_SIZE - OFFSET))
+            # (B) 追加ループ (Append)
+            UPLOADED=$CHUNK_SIZE
+            
+            while [ "$UPLOADED" -lt "$FILE_SIZE" ]; do
+              REMAINING=$((FILE_SIZE - UPLOADED))
               
-              if [ "$REMAINING" -le "$CHUNK_SIZE" ]; then
-                # 最終コミット (Finish)
-                dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 skip=$((OFFSET / CHUNK_SIZE)) status=none
-                API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "commit": {"path": "%s","mode": "add","autorename": true,"mute": false,"strict_conflict": false}}' "$SESSION_ID" "$OFFSET" "$DBX_PATH")
-                
-                RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/finish \
-                  --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
-                  --header "Dropbox-API-Arg: $API_ARG" \
-                  --header "Content-Type: application/octet-stream" \
-                  --data-binary @"$TMP_CHUNK")
-                  
-                OFFSET=$FILE_SIZE
+              # 送信サイズ決定
+              if [ "$REMAINING" -gt "$CHUNK_SIZE" ]; then
+                CURRENT_SEND_SIZE=$CHUNK_SIZE
+                IS_LAST=false
               else
-                # 追加 (Append)
-                dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 skip=$((OFFSET / CHUNK_SIZE)) status=none
-                API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "close": false}' "$SESSION_ID" "$OFFSET")
-                
-                RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/append_v2 \
-                  --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
-                  --header "Dropbox-API-Arg: $API_ARG" \
-                  --header "Content-Type: application/octet-stream" \
-                  --data-binary @"$TMP_CHUNK")
-                  
-                OFFSET=$((OFFSET + CHUNK_SIZE))
+                CURRENT_SEND_SIZE=$REMAINING
+                IS_LAST=true
               fi
+
+              # チャンク切り出し (bs=CHUNK_SIZE で skip する)
+              # ※ count=1 で確実に1チャンク分だけ切り出す
+              SKIP_BLOCKS=$((UPLOADED / CHUNK_SIZE))
+              dd if="$FILE" of="$TMP_CHUNK" bs=$CHUNK_SIZE count=1 skip=$SKIP_BLOCKS status=none
+
+              if [ "$IS_LAST" = "true" ]; then
+                 # --- 終了 (Finish) ---
+                 echo "  最後のチャンクをアップロード中..."
+                 API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "commit": {"path": "%s","mode": "add","autorename": true,"mute": false,"strict_conflict": false}}' "$SESSION_ID" "$UPLOADED" "$DBX_PATH")
+                 
+                 RESP=$(curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/finish \
+                   --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+                   --header "Dropbox-API-Arg: $API_ARG" \
+                   --header "Content-Type: application/octet-stream" \
+                   --data-binary @"$TMP_CHUNK")
+              else
+                 # --- 追加 (Append) ---
+                 echo "  チャンクを追加中 ($UPLOADED bytes 完了)..."
+                 API_ARG=$(printf '{"cursor": {"session_id": "%s","offset": %d}, "close": false}' "$SESSION_ID" "$UPLOADED")
+                 
+                 curl -sS -X POST https://content.dropboxapi.com/2/files/upload_session/append_v2 \
+                   --header "Authorization: Bearer $DROPBOX_ACCESS_TOKEN" \
+                   --header "Dropbox-API-Arg: $API_ARG" \
+                   --header "Content-Type: application/octet-stream" \
+                   --data-binary @"$TMP_CHUNK" > /dev/null
+              fi
+              
+              UPLOADED=$((UPLOADED + CURRENT_SEND_SIZE))
             done
             rm -f "$TMP_CHUNK"
           fi
 
-          # レスポンス検証
+          # レスポンス検証 (エラーが含まれていないか)
           if echo "$RESP" | grep -q '"error"'; then
              echo "::error::$FILENAME のアップロードに失敗しました。"
              echo "$RESP"
